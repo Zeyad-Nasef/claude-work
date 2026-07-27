@@ -1,0 +1,12 @@
+# Never commit credentials
+ck.txt
+*cookies*.txt
+
+# Source media / build intermediates (re-downloadable)
+vid.*
+*.part
+potprobe.*
+probe*.*
+test_*
+potsrv/
+pot.log
