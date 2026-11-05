@@ -44,11 +44,48 @@ YouTube. The only missing piece was a call to fetch a single track by ID.
 
 What's been checked so far:
 
-- The parser and its tests pass.
+- The whole app builds with the patch, both `assembleFossDebug` and
+  `assembleFossRelease`.
+- All 27 Spotify unit tests pass, including the 8 new SpotifyLinkTest ones.
+- The built APK has the open.spotify.com filter, and R8 keeps the new code.
 - The patch applies cleanly to upstream main.
 
-What hasn't been checked: the MainActivity, Spotify.kt and manifest changes
-haven't been compiled or run on a phone yet. That's the next step.
+What hasn't been checked: running it on a real phone. That's the test list
+further down.
+
+## Prebuilt APK
+
+There's already a build of this patch, so you can skip straight to the phone
+settings below.
+
+- `Meld-plus-spotify-links.apk` is a release build, minified like the official
+  one. App name "Meld+", package `com.meld.app.links`. It installs next to the
+  normal Meld, so nothing gets overwritten.
+- It's signed with my own key (`meld-plus.jks`, alias `meldplus`, password in
+  `keystore-password.txt`). Keep that key around. Without it, a newer build
+  can't update Meld+ in place.
+- There's also a debug build ("Meld Debug", `com.meld.app.debug`), but it's
+  slower. Use the release one.
+
+Things that behave differently from the official app:
+
+- You have to log in to Spotify again inside Meld+, because it has its own data.
+- Last.fm login/scrobbling won't work. The Last.fm API keys are maintainer
+  secrets and aren't in this build.
+- The built-in updater still checks the official releases. If it offers an
+  update, ignore it. That would install the official Meld, not update Meld+.
+
+How it was built (from the patched repo):
+
+```bash
+METROLIST_APPLICATION_ID=com.meld.app.links METROLIST_APP_NAME="Meld+" \
+  ./gradlew :app:assembleFossRelease
+apksigner sign --ks meld-plus.jks --ks-key-alias meldplus \
+  --out Meld-plus-spotify-links.apk app/build/outputs/apk/foss/release/app-foss-release-unsigned.apk
+```
+
+For the phone settings below, use "Meld+" and `com.meld.app.links` instead of
+"Meld Debug" and `com.meld.app.debug`.
 
 ## Getting it on the phone
 
