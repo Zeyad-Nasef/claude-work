@@ -31,8 +31,16 @@ YouTube. The only missing piece was a call to fetch a single track by ID.
   autoVerify since only Spotify can verify spotify.com.
 - `SpotifyLink.kt`: small parser that gets the type and ID out of a URL, a
   `spotify:` URI or shared text like "Song - Artist https://open.spotify.com/...".
-- `Spotify.track(id)`: uses the REST endpoint. GQL has getTrack, but it isn't
-  in the hash registry (`docs/spotify-gql-hashes.json`).
+- `Spotify.track(id)`: reads the link preview tags (title, artists, album,
+  cover, duration) from the public track page, the same tags WhatsApp uses for
+  the preview. `SpotifyTrackPage.kt` does the parsing.
+  - It used to call REST `tracks/{id}`, but REST gets rate limited with the web
+    player token (Meld's own `SpotifyProfileCache` says so), and that's why the
+    first test build showed "Couldn't open this Spotify link".
+  - REST is still there as a fail-fast fallback.
+  - Spotify only puts those tags in the page for non-browser clients, so the
+    request uses a plain "Meld" user agent instead of Meld's usual desktop
+    Chrome one.
 - `MainActivity`: Spotify links are handled before the rest of
   `handleDeepLinkIntent`.
   - Playlist and album links open the Spotify screens.
@@ -189,10 +197,11 @@ Their PR CI runs the unit tests, so SpotifyLinkTest gets checked there.
 - spotify.link short links. They're redirects, so Meld would have to follow
   the redirect first. I left them out of the manifest on purpose. Otherwise
   they'd open Meld and do nothing.
-- If the REST track call starts getting rate limited, switch to GQL getTrack
-  and add its hash to SpotifyHashProvider and the JSON registry (see AGENTS.md).
-- It needs a Spotify login. A possible fallback is to read the og: tags from
-  the track page and search YT Music.
+- If Spotify ever drops the preview tags from track pages, the proper fix is
+  GQL getTrack. Its hash would need adding to SpotifyHashProvider and the JSON
+  registry (see AGENTS.md).
+- Links still require a Spotify login. Track lookups no longer need it, but
+  playlists, albums and the radio queue do.
 - Podcasts aren't supported because Meld can't play them.
 - Cold start: same as the YouTube links, `playerConnection` might not be bound
   yet when the link arrives. Watch for that when testing with the app closed.

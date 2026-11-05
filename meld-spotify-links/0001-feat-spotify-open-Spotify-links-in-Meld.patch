@@ -1,4 +1,4 @@
-From 733997f252cd06d20287bc01ca0c9029ced71df3 Mon Sep 17 00:00:00 2001
+From f3124ec3d895b097b419c3aeea54384fcdea4040 Mon Sep 17 00:00:00 2001
 From: Zeyad Nasef <zeyad.nasef.fci@gmail.com>
 Date: Thu, 5 Nov 2026 00:59:41 +0000
 Subject: [PATCH] feat(spotify): open Spotify links in Meld
@@ -12,18 +12,26 @@ through SpotifyQueue like they do from home, and artists open the matching
 YT Music artist. Works for shared links too. Episodes and shows just show a
 toast since we can't play podcasts from Spotify.
 
+Track details come from the link preview tags on the public track page.
+REST tracks/{id} gets rate limited with the web player token (same as top
+tracks), so it's only kept as a fail-fast fallback.
+
 The filter isn't autoVerify (we can't verify spotify.com), so users have to
 add the link manually in the app's "Open by default" settings.
 ---
- app/src/main/AndroidManifest.xml              | 20 +++++
- .../com/metrolist/music/MainActivity.kt       | 75 +++++++++++++++++
- .../kotlin/com/metrolist/spotify/Spotify.kt   |  7 ++
- .../com/metrolist/spotify/SpotifyLink.kt      | 32 ++++++++
+ app/src/main/AndroidManifest.xml              | 20 ++++
+ .../com/metrolist/music/MainActivity.kt       | 75 +++++++++++++++
+ .../kotlin/com/metrolist/spotify/Spotify.kt   | 29 ++++++
+ .../com/metrolist/spotify/SpotifyLink.kt      | 32 +++++++
+ .../com/metrolist/spotify/SpotifyTrackPage.kt | 69 ++++++++++++++
  app/src/main/res/values/metrolist_strings.xml |  3 +
- .../com/metrolist/spotify/SpotifyLinkTest.kt  | 80 +++++++++++++++++++
- 6 files changed, 217 insertions(+)
+ .../com/metrolist/spotify/SpotifyLinkTest.kt  | 80 ++++++++++++++++
+ .../metrolist/spotify/SpotifyTrackPageTest.kt | 93 +++++++++++++++++++
+ 8 files changed, 401 insertions(+)
  create mode 100644 app/src/main/kotlin/com/metrolist/spotify/SpotifyLink.kt
+ create mode 100644 app/src/main/kotlin/com/metrolist/spotify/SpotifyTrackPage.kt
  create mode 100644 app/src/test/kotlin/com/metrolist/spotify/SpotifyLinkTest.kt
+ create mode 100644 app/src/test/kotlin/com/metrolist/spotify/SpotifyTrackPageTest.kt
 
 diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
 index 91e74af..61851ea 100644
@@ -178,18 +186,40 @@ index f5f8a46..b2ce3f6 100644
      private fun setSystemBarAppearance(isDark: Boolean) {
          WindowCompat.getInsetsController(window, window.decorView.rootView).apply {
 diff --git a/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt b/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt
-index 9906161..2da69ed 100644
+index 9906161..c03bea9 100644
 --- a/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt
 +++ b/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt
-@@ -1438,6 +1438,13 @@ object Spotify {
+@@ -1438,6 +1438,35 @@ object Spotify {
          )
      }
  
-+    // ── Track (REST — getTrack isn't in the GQL hash registry yet) ──────
++    // ── Track (public track page, REST fallback) ────────────────────────
++    // REST tracks/{id} gets rate limited like top tracks, and getTrack isn't in the
++    // GQL hash registry, so read the link preview tags from the track page first.
++    // Spotify only serves those tags to non-browser clients, hence the plain UA.
++
++    private val pageClient by lazy {
++        HttpClient(OkHttp) {
++            defaultRequest {
++                header("User-Agent", "Meld")
++            }
++            expectSuccess = false
++        }
++    }
 +
 +    suspend fun track(trackId: String): Result<SpotifyTrack> =
 +        runCatching {
-+            authenticatedGet("tracks/$trackId")
++            val response = pageClient.get("https://open.spotify.com/track/$trackId")
++            val fromPage =
++                if (response.status.value in 200..299) {
++                    SpotifyTrackPage.parse(trackId, response.bodyAsText())
++                } else {
++                    null
++                }
++            fromPage ?: run {
++                log("W", "Track page for $trackId had no metadata (${response.status.value}), trying REST")
++                authenticatedGet<SpotifyTrack>("tracks/$trackId", failFastOn429 = true)
++            }
 +        }
 +
      // ── Albums (GQL: getAlbum) ──────────────────────────────────────────
@@ -232,6 +262,81 @@ index 0000000..75865f8
 +
 +        fun isSpotifyLink(text: String): Boolean = ANY_SPOTIFY.containsMatchIn(text)
 +    }
++}
+diff --git a/app/src/main/kotlin/com/metrolist/spotify/SpotifyTrackPage.kt b/app/src/main/kotlin/com/metrolist/spotify/SpotifyTrackPage.kt
+new file mode 100644
+index 0000000..89ab23c
+--- /dev/null
++++ b/app/src/main/kotlin/com/metrolist/spotify/SpotifyTrackPage.kt
+@@ -0,0 +1,69 @@
++package com.metrolist.spotify
++
++import com.metrolist.spotify.models.SpotifyImage
++import com.metrolist.spotify.models.SpotifySimpleAlbum
++import com.metrolist.spotify.models.SpotifySimpleArtist
++import com.metrolist.spotify.models.SpotifyTrack
++
++/** Reads a track from the link preview tags of its open.spotify.com page. */
++internal object SpotifyTrackPage {
++    private val META_TAG = Regex("<meta (?:property|name)=\"([^\"]+)\" content=\"([^\"]*)\"")
++    private val HTML_ENTITY = Regex("&(#x[0-9a-fA-F]+|#[0-9]+|amp|quot|apos|lt|gt);")
++
++    fun parse(
++        trackId: String,
++        html: String,
++    ): SpotifyTrack? {
++        val tags = META_TAG.findAll(html).groupBy({ it.groupValues[1] }, { decode(it.groupValues[2]) })
++        fun tag(name: String) = tags[name]?.firstOrNull()?.takeIf { it.isNotBlank() }
++
++        val name = tag("og:title") ?: return null
++
++        // Names come joined with ", ", which breaks names like "Tyler, The Creator",
++        // so only split them when the count matches the artist links.
++        val artistIds = tags["music:musician"].orEmpty().map { it.idFromUrl() }
++        val artistNames = tag("music:musician_description").orEmpty()
++        val names = artistNames.split(", ").takeIf { it.size == artistIds.size } ?: listOf(artistNames)
++        val artists =
++            names.filter { it.isNotBlank() }.mapIndexed { i, artistName ->
++                val id = artistIds.getOrNull(i)
++                SpotifySimpleArtist(id = id, name = artistName, uri = id?.let { "spotify:artist:$it" })
++            }
++
++        val album =
++            tag("music:album")?.idFromUrl()?.let { albumId ->
++                SpotifySimpleAlbum(
++                    id = albumId,
++                    // og:description is "Artist · Album · Song · Year"
++                    name = tag("og:description")?.split(" · ")?.getOrNull(1).orEmpty(),
++                    images = listOfNotNull(tag("og:image")?.let { SpotifyImage(url = it) }),
++                    uri = "spotify:album:$albumId",
++                )
++            }
++
++        return SpotifyTrack(
++            id = trackId,
++            name = name,
++            artists = artists,
++            album = album,
++            durationMs = (tag("music:duration")?.toIntOrNull() ?: 0) * 1000,
++            uri = "spotify:track:$trackId",
++        )
++    }
++
++    private fun String.idFromUrl() = substringBefore('?').trimEnd('/').substringAfterLast('/')
++
++    private fun decode(text: String) =
++        HTML_ENTITY.replace(text) { match ->
++            val entity = match.groupValues[1]
++            when {
++                entity.startsWith("#x") -> entity.drop(2).toIntOrNull(16)?.let { String(Character.toChars(it)) }
++                entity.startsWith("#") -> entity.drop(1).toIntOrNull()?.let { String(Character.toChars(it)) }
++                entity == "amp" -> "&"
++                entity == "quot" -> "\""
++                entity == "apos" -> "'"
++                entity == "lt" -> "<"
++                else -> ">"
++            } ?: match.value
++        }
 +}
 diff --git a/app/src/main/res/values/metrolist_strings.xml b/app/src/main/res/values/metrolist_strings.xml
 index 4f89b46..0e6e183 100644
@@ -331,6 +436,105 @@ index 0000000..778d3d9
 +        assertTrue(SpotifyLink.isSpotifyLink("spotify:show:$id"))
 +        assertFalse(SpotifyLink.isSpotifyLink("https://music.youtube.com/watch?v=dQw4w9WgXcQ"))
 +        assertFalse(SpotifyLink.isSpotifyLink("Now playing on spotify: great song"))
++    }
++}
+diff --git a/app/src/test/kotlin/com/metrolist/spotify/SpotifyTrackPageTest.kt b/app/src/test/kotlin/com/metrolist/spotify/SpotifyTrackPageTest.kt
+new file mode 100644
+index 0000000..8200632
+--- /dev/null
++++ b/app/src/test/kotlin/com/metrolist/spotify/SpotifyTrackPageTest.kt
+@@ -0,0 +1,93 @@
++package com.metrolist.spotify
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++// Tags copied from real open.spotify.com track pages.
++class SpotifyTrackPageTest {
++
++    @Test
++    fun `reads a single artist track`() {
++        val html = """
++            <meta property="og:site_name" content="Spotify"/>
++            <meta property="og:title" content="Black Friday - Mahogany Session"/>
++            <meta property="og:description" content="Tom Odell · Black Friday EP · Song · 2024"/>
++            <meta property="og:image" content="https://i.scdn.co/image/ab67616d0000b273614a1828185a325ad7e35334"/>
++            <meta name="music:duration" content="224"/>
++            <meta name="music:album" content="https://open.spotify.com/album/0g5N9f6FpdYuON9ahdmu5n"/>
++            <meta name="music:musician" content="https://open.spotify.com/artist/2txHhyCwHjUEpJjWrEyqyX"/>
++            <meta name="music:musician_description" content="Tom Odell"/>
++        """.trimIndent()
++
++        val track = SpotifyTrackPage.parse("7ymcTupikH8sq5OtHWCLZK", html)!!
++
++        assertEquals("7ymcTupikH8sq5OtHWCLZK", track.id)
++        assertEquals("Black Friday - Mahogany Session", track.name)
++        assertEquals(224_000, track.durationMs)
++        assertEquals("spotify:track:7ymcTupikH8sq5OtHWCLZK", track.uri)
++        assertEquals(1, track.artists.size)
++        assertEquals("Tom Odell", track.artists[0].name)
++        assertEquals("2txHhyCwHjUEpJjWrEyqyX", track.artists[0].id)
++        assertEquals("0g5N9f6FpdYuON9ahdmu5n", track.album?.id)
++        assertEquals("Black Friday EP", track.album?.name)
++        assertEquals(
++            "https://i.scdn.co/image/ab67616d0000b273614a1828185a325ad7e35334",
++            track.album?.images?.firstOrNull()?.url,
++        )
++    }
++
++    @Test
++    fun `pairs multiple artists with their links`() {
++        val html = """
++            <meta property="og:title" content="Señorita"/>
++            <meta property="og:description" content="Shawn Mendes, Camila Cabello · Shawn Mendes (Deluxe) · Song · 2019"/>
++            <meta name="music:duration" content="191"/>
++            <meta name="music:album" content="https://open.spotify.com/album/0xzScN8P3hQAz3BT3YYX5w"/>
++            <meta name="music:musician" content="https://open.spotify.com/artist/7n2wHs1TKAczGzO7Dd2rGr"/>
++            <meta name="music:musician" content="https://open.spotify.com/artist/4nDoRrQiYLoBzwC5BhVJzF"/>
++            <meta name="music:musician_description" content="Shawn Mendes, Camila Cabello"/>
++        """.trimIndent()
++
++        val track = SpotifyTrackPage.parse("6v3KW9xbzN5yKLt9YKDYA2", html)!!
++
++        assertEquals(listOf("Shawn Mendes", "Camila Cabello"), track.artists.map { it.name })
++        assertEquals(listOf("7n2wHs1TKAczGzO7Dd2rGr", "4nDoRrQiYLoBzwC5BhVJzF"), track.artists.map { it.id })
++        assertEquals("Shawn Mendes (Deluxe)", track.album?.name)
++    }
++
++    @Test
++    fun `decodes html entities`() {
++        val html = """
++            <meta property="og:title" content="Don&#x27;t Stop Me Now - Remastered 2011"/>
++            <meta name="music:musician" content="https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"/>
++            <meta name="music:musician_description" content="Queen &amp; Friends"/>
++        """.trimIndent()
++
++        val track = SpotifyTrackPage.parse("7hQJA50XrCWABAu5v6QZ4i", html)!!
++
++        assertEquals("Don't Stop Me Now - Remastered 2011", track.name)
++        assertEquals("Queen & Friends", track.artists.single().name)
++    }
++
++    @Test
++    fun `keeps a comma in a single artist name`() {
++        val html = """
++            <meta property="og:title" content="See You Again"/>
++            <meta name="music:musician" content="https://open.spotify.com/artist/4V8LLVI7PbaPR0K2TGSxFF"/>
++            <meta name="music:musician_description" content="Tyler, The Creator"/>
++        """.trimIndent()
++
++        val track = SpotifyTrackPage.parse("7KA4W4McWYRpgf0fWsJZWB", html)!!
++
++        assertEquals("Tyler, The Creator", track.artists.single().name)
++        assertEquals("4V8LLVI7PbaPR0K2TGSxFF", track.artists.single().id)
++    }
++
++    @Test
++    fun `returns null for the web player shell without tags`() {
++        val html = """<meta property="og:site_name" content="Spotify"/><title>Spotify – Web Player</title>"""
++
++        assertNull(SpotifyTrackPage.parse("7ymcTupikH8sq5OtHWCLZK", html))
 +    }
 +}
 -- 
