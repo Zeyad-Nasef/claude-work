@@ -1,0 +1,338 @@
+From a63ccbb04b384dad785d27a8bf09004efcf40374 Mon Sep 17 00:00:00 2001
+From: Zeyad Nasef <zeyad.nasef.fci@gmail.com>
+Date: Thu, 5 Nov 2026 00:59:41 +0000
+Subject: [PATCH] feat(spotify): open Spotify links in Meld
+
+open.spotify.com wasn't declared in the manifest, so Android never offered
+it under "Open by default", and handleDeepLinkIntent only knew YouTube URLs
+so a Spotify link opened the app and did nothing.
+
+Playlists and albums now go to the existing Spotify screens, tracks play
+through SpotifyQueue like they do from home, and artists open the matching
+YT Music artist. Works for shared links too. Episodes and shows just show a
+toast since we can't play podcasts from Spotify.
+
+The filter isn't autoVerify (we can't verify spotify.com), so users have to
+add the link manually in the app's "Open by default" settings.
+---
+ app/src/main/AndroidManifest.xml              | 20 +++++
+ .../com/metrolist/music/MainActivity.kt       | 75 +++++++++++++++++
+ .../kotlin/com/metrolist/spotify/Spotify.kt   |  7 ++
+ .../com/metrolist/spotify/SpotifyLink.kt      | 32 ++++++++
+ app/src/main/res/values/metrolist_strings.xml |  3 +
+ .../com/metrolist/spotify/SpotifyLinkTest.kt  | 80 +++++++++++++++++++
+ 6 files changed, 217 insertions(+)
+ create mode 100644 app/src/main/kotlin/com/metrolist/spotify/SpotifyLink.kt
+ create mode 100644 app/src/test/kotlin/com/metrolist/spotify/SpotifyLinkTest.kt
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 91e74af..5c832ea 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -159,6 +159,26 @@
+                 <data android:scheme="vnd.youtube.launch" />
+             </intent-filter>
+ 
++            <!-- Spotify filter. No autoVerify since we can't verify spotify.com,
++                 users enable it from "Open by default" -->
++            <intent-filter>
++                <action android:name="android.intent.action.VIEW" />
++
++                <category android:name="android.intent.category.DEFAULT" />
++                <category android:name="android.intent.category.BROWSABLE" />
++
++                <data android:scheme="http" />
++                <data android:scheme="https" />
++                <data android:host="open.spotify.com" />
++                <data android:pathPrefix="/track/" />
++                <data android:pathPrefix="/album/" />
++                <data android:pathPrefix="/playlist/" />
++                <data android:pathPrefix="/artist/" />
++                <data android:pathPrefix="/intl-" />
++                <data android:pathPrefix="/embed/" />
++                <data android:pathPrefix="/user/" />
++            </intent-filter>
++
+             <!-- Share filter -->
+             <intent-filter>
+                 <action android:name="android.intent.action.SEND" />
+diff --git a/app/src/main/kotlin/com/metrolist/music/MainActivity.kt b/app/src/main/kotlin/com/metrolist/music/MainActivity.kt
+index f5f8a46..b2ce3f6 100644
+--- a/app/src/main/kotlin/com/metrolist/music/MainActivity.kt
++++ b/app/src/main/kotlin/com/metrolist/music/MainActivity.kt
+@@ -131,6 +131,7 @@ import coil3.request.allowHardware
+ import coil3.request.crossfade
+ import coil3.toBitmap
+ import com.metrolist.innertube.YouTube
++import com.metrolist.innertube.models.ArtistItem
+ import com.metrolist.innertube.models.SongItem
+ import com.metrolist.innertube.models.WatchEndpoint
+ import com.metrolist.music.constants.AppBarHeight
+@@ -178,6 +179,8 @@ import com.metrolist.music.playback.DownloadUtil
+ import com.metrolist.music.playback.MusicService
+ import com.metrolist.music.playback.MusicService.MusicBinder
+ import com.metrolist.music.playback.PlayerConnection
++import com.metrolist.music.playback.SpotifyYouTubeMapper
++import com.metrolist.music.playback.queues.SpotifyQueue
+ import com.metrolist.music.playback.queues.YouTubeQueue
+ import com.metrolist.music.ui.component.AccountSettingsDialog
+ import com.metrolist.music.ui.component.AppNavigationBar
+@@ -203,6 +206,7 @@ import com.metrolist.music.ui.utils.appBarScrollBehavior
+ import com.metrolist.music.ui.utils.resetHeightOffset
+ import com.metrolist.music.utils.ReleaseInfo
+ import com.metrolist.music.utils.SearchRoutes
++import com.metrolist.music.utils.SpotifyTokenManager
+ import com.metrolist.music.utils.SyncUtils
+ import com.metrolist.music.utils.ArtistNameAliases
+ import com.metrolist.music.utils.Updater
+@@ -213,6 +217,7 @@ import com.metrolist.music.utils.rememberEnumPreference
+ import com.metrolist.music.utils.rememberPreference
+ import com.metrolist.music.utils.reportException
+ import com.metrolist.spotify.Spotify
++import com.metrolist.spotify.SpotifyLink
+ 
+ import com.metrolist.music.utils.setAppLocale
+ import com.metrolist.music.viewmodels.HomeViewModel
+@@ -1599,6 +1604,18 @@ class MainActivity : FragmentActivity() {
+         intent.removeExtra(Intent.EXTRA_TEXT)
+         val coroutineScope = lifecycle.coroutineScope
+ 
++        // Keep this above the getQueryParameter() calls, they throw on spotify:track:xxx URIs
++        val linkText = uri.toString()
++        val spotifyLink = SpotifyLink.parse(linkText)
++        if (spotifyLink != null) {
++            openSpotifyLink(spotifyLink, navController)
++            return
++        }
++        if (SpotifyLink.isSpotifyLink(linkText)) {
++            Toast.makeText(this, R.string.spotify_link_unsupported, Toast.LENGTH_SHORT).show()
++            return
++        }
++
+         val listenCode =
+             uri.getQueryParameter("code")
+                 ?: uri.getQueryParameter("room")
+@@ -1703,6 +1720,64 @@ class MainActivity : FragmentActivity() {
+         }
+     }
+ 
++    private fun openSpotifyLink(
++        link: SpotifyLink,
++        navController: NavHostController,
++    ) {
++        lifecycle.coroutineScope.launch {
++            if (!SpotifyTokenManager.ensureAuthenticated()) {
++                Toast.makeText(this@MainActivity, R.string.spotify_link_login_required, Toast.LENGTH_LONG).show()
++                navController.navigate("settings/spotify/login")
++                return@launch
++            }
++
++            when (link.type) {
++                SpotifyLink.Type.PLAYLIST -> navController.navigate("spotify_playlist/${link.id}")
++
++                SpotifyLink.Type.ALBUM -> navController.navigate("spotify_album/${link.id}")
++
++                SpotifyLink.Type.TRACK -> {
++                    val track =
++                        withContext(Dispatchers.IO) { Spotify.track(link.id) }
++                            .onFailure { reportException(it) }
++                            .getOrNull()
++                    if (track == null) {
++                        Toast.makeText(this@MainActivity, R.string.spotify_link_failed, Toast.LENGTH_SHORT).show()
++                        return@launch
++                    }
++                    playerConnection?.playQueue(
++                        SpotifyQueue(
++                            initialTrack = track,
++                            mapper = SpotifyYouTubeMapper(database),
++                            context = applicationContext,
++                            database = database,
++                        ),
++                    )
++                }
++
++                // No Spotify artist screen, same as the home feed we open the YT Music artist
++                SpotifyLink.Type.ARTIST -> {
++                    val youtubeArtistId =
++                        withContext(Dispatchers.IO) {
++                            val name = Spotify.artist(link.id).getOrNull()?.name
++                            if (name.isNullOrBlank()) return@withContext null
++                            YouTube
++                                .search(name, YouTube.SearchFilter.FILTER_ARTIST)
++                                .getOrNull()
++                                ?.items
++                                ?.firstOrNull { it is ArtistItem }
++                                ?.id
++                        }
++                    if (youtubeArtistId == null) {
++                        Toast.makeText(this@MainActivity, R.string.spotify_link_failed, Toast.LENGTH_SHORT).show()
++                        return@launch
++                    }
++                    navController.navigate("artist/$youtubeArtistId")
++                }
++            }
++        }
++    }
++
+     @SuppressLint("ObsoleteSdkInt")
+     private fun setSystemBarAppearance(isDark: Boolean) {
+         WindowCompat.getInsetsController(window, window.decorView.rootView).apply {
+diff --git a/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt b/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt
+index 9906161..2da69ed 100644
+--- a/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt
++++ b/app/src/main/kotlin/com/metrolist/spotify/Spotify.kt
+@@ -1438,6 +1438,13 @@ object Spotify {
+         )
+     }
+ 
++    // ── Track (REST — getTrack isn't in the GQL hash registry yet) ──────
++
++    suspend fun track(trackId: String): Result<SpotifyTrack> =
++        runCatching {
++            authenticatedGet("tracks/$trackId")
++        }
++
+     // ── Albums (GQL: getAlbum) ──────────────────────────────────────────
+ 
+     suspend fun album(albumId: String): Result<SpotifyAlbum> =
+diff --git a/app/src/main/kotlin/com/metrolist/spotify/SpotifyLink.kt b/app/src/main/kotlin/com/metrolist/spotify/SpotifyLink.kt
+new file mode 100644
+index 0000000..75865f8
+--- /dev/null
++++ b/app/src/main/kotlin/com/metrolist/spotify/SpotifyLink.kt
+@@ -0,0 +1,32 @@
++package com.metrolist.spotify
++
++data class SpotifyLink(
++    val type: Type,
++    val id: String,
++) {
++    enum class Type { TRACK, ALBUM, PLAYLIST, ARTIST }
++
++    companion object {
++        private const val TYPE = "(track|album|playlist|artist)"
++        private const val ID = "([A-Za-z0-9]{22})(?![A-Za-z0-9])"
++
++        // Spotify sometimes puts a locale (/intl-de/), /embed/ or a legacy /user/<name>/
++        // before the item type.
++        private val WEB_URL =
++            Regex(
++                "https?://open\\.spotify\\.com/(?:intl-[a-z-]+/)?(?:embed/)?(?:user/[^/?#\\s]+/)?$TYPE/$ID",
++                RegexOption.IGNORE_CASE,
++            )
++        private val URI = Regex("spotify:(?:user:[^:\\s]+:)?$TYPE:$ID", RegexOption.IGNORE_CASE)
++        private val ANY_SPOTIFY = Regex("https?://open\\.spotify\\.com/|spotify:[a-z]+:", RegexOption.IGNORE_CASE)
++
++        // Searches the whole string because shared text often has the title before the link.
++        fun parse(text: String): SpotifyLink? {
++            val match = WEB_URL.find(text) ?: URI.find(text) ?: return null
++            val (type, id) = match.destructured
++            return SpotifyLink(Type.valueOf(type.uppercase()), id)
++        }
++
++        fun isSpotifyLink(text: String): Boolean = ANY_SPOTIFY.containsMatchIn(text)
++    }
++}
+diff --git a/app/src/main/res/values/metrolist_strings.xml b/app/src/main/res/values/metrolist_strings.xml
+index 4f89b46..0e6e183 100644
+--- a/app/src/main/res/values/metrolist_strings.xml
++++ b/app/src/main/res/values/metrolist_strings.xml
+@@ -1069,6 +1069,9 @@
+     <string name="spotify_status_connecting">Obtaining access token…</string>
+     <string name="spotify_status_loading_profile">Loading your profile…</string>
+     <string name="spotify_login_error">Login failed. Please try again.</string>
++    <string name="spotify_link_login_required">Log in with Spotify to open Spotify links</string>
++    <string name="spotify_link_failed">Couldn\'t open this Spotify link</string>
++    <string name="spotify_link_unsupported">This type of Spotify link isn\'t supported</string>
+     <string name="spotify_login_error_no_cookie">Could not retrieve session cookie. Please try logging in again.</string>
+     <string name="spotify_login_error_expired">Session expired or invalid. Please log in with your credentials again.</string>
+     <string name="spotify_login_error_rejected">Spotify rejected the request. Please try again later.</string>
+diff --git a/app/src/test/kotlin/com/metrolist/spotify/SpotifyLinkTest.kt b/app/src/test/kotlin/com/metrolist/spotify/SpotifyLinkTest.kt
+new file mode 100644
+index 0000000..778d3d9
+--- /dev/null
++++ b/app/src/test/kotlin/com/metrolist/spotify/SpotifyLinkTest.kt
+@@ -0,0 +1,80 @@
++package com.metrolist.spotify
++
++import com.metrolist.spotify.SpotifyLink.Type
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class SpotifyLinkTest {
++
++    private val id = "4uLU6hMCjMI75M1A2tKUQC"
++
++    @Test
++    fun `parses each supported web url type`() {
++        assertEquals(SpotifyLink(Type.TRACK, id), SpotifyLink.parse("https://open.spotify.com/track/$id"))
++        assertEquals(SpotifyLink(Type.ALBUM, id), SpotifyLink.parse("https://open.spotify.com/album/$id"))
++        assertEquals(SpotifyLink(Type.PLAYLIST, id), SpotifyLink.parse("https://open.spotify.com/playlist/$id"))
++        assertEquals(SpotifyLink(Type.ARTIST, id), SpotifyLink.parse("https://open.spotify.com/artist/$id"))
++    }
++
++    @Test
++    fun `ignores share tracking query and fragment`() {
++        assertEquals(
++            SpotifyLink(Type.TRACK, id),
++            SpotifyLink.parse("https://open.spotify.com/track/$id?si=a1b2c3d4e5f64a7b&context=spotify%3Aplaylist%3Ax#t=10"),
++        )
++    }
++
++    @Test
++    fun `handles locale embed and legacy user prefixes`() {
++        assertEquals(SpotifyLink(Type.TRACK, id), SpotifyLink.parse("https://open.spotify.com/intl-de/track/$id"))
++        assertEquals(SpotifyLink(Type.ALBUM, id), SpotifyLink.parse("https://open.spotify.com/intl-pt-BR/album/$id"))
++        assertEquals(SpotifyLink(Type.PLAYLIST, id), SpotifyLink.parse("https://open.spotify.com/embed/playlist/$id"))
++        assertEquals(
++            SpotifyLink(Type.PLAYLIST, id),
++            SpotifyLink.parse("https://open.spotify.com/user/spotify/playlist/$id"),
++        )
++    }
++
++    @Test
++    fun `parses spotify uris`() {
++        assertEquals(SpotifyLink(Type.TRACK, id), SpotifyLink.parse("spotify:track:$id"))
++        assertEquals(SpotifyLink(Type.PLAYLIST, id), SpotifyLink.parse("spotify:user:someone:playlist:$id"))
++    }
++
++    @Test
++    fun `finds the link inside shared text`() {
++        assertEquals(
++            SpotifyLink(Type.TRACK, id),
++            SpotifyLink.parse("Song Title - Artist https://open.spotify.com/track/$id?si=xyz"),
++        )
++    }
++
++    @Test
++    fun `album link with highlighted track opens the album`() {
++        assertEquals(
++            SpotifyLink(Type.ALBUM, id),
++            SpotifyLink.parse("https://open.spotify.com/album/$id?highlight=spotify:track:0VjIjW4GlUZAMYd2vXMi3b"),
++        )
++    }
++
++    @Test
++    fun `rejects unsupported types, bad ids and other hosts`() {
++        assertNull(SpotifyLink.parse("https://open.spotify.com/episode/$id"))
++        assertNull(SpotifyLink.parse("https://open.spotify.com/show/$id"))
++        assertNull(SpotifyLink.parse("https://open.spotify.com/track/short"))
++        assertNull(SpotifyLink.parse("https://open.spotify.com/track/${id}EXTRA"))
++        assertNull(SpotifyLink.parse("https://evil.example/open.spotify.com/track/$id"))
++        assertNull(SpotifyLink.parse("https://music.youtube.com/watch?v=dQw4w9WgXcQ"))
++    }
++
++    @Test
++    fun `isSpotifyLink flags unsupported spotify links but not other text`() {
++        assertTrue(SpotifyLink.isSpotifyLink("https://open.spotify.com/episode/$id"))
++        assertTrue(SpotifyLink.isSpotifyLink("spotify:show:$id"))
++        assertFalse(SpotifyLink.isSpotifyLink("https://music.youtube.com/watch?v=dQw4w9WgXcQ"))
++        assertFalse(SpotifyLink.isSpotifyLink("Now playing on spotify: great song"))
++    }
++}
+-- 
+2.43.0
+
