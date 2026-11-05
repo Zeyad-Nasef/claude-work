@@ -54,7 +54,8 @@ What's been checked so far:
 
 - The whole app builds with the patch, both `assembleFossDebug` and
   `assembleFossRelease`.
-- All 27 Spotify unit tests pass, including the 8 new SpotifyLinkTest ones.
+- All 32 Spotify unit tests pass, including the new SpotifyLinkTest (8) and
+  SpotifyTrackPageTest (5). The page tests use tags copied from real track pages.
 - The built APK has the open.spotify.com filter, and R8 keeps the new code.
 - `lintFossDebug` passes. The only warning on the new lines was the missing
   autoVerify, which is on purpose, so it's marked with
