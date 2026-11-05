@@ -1,4 +1,4 @@
-From a63ccbb04b384dad785d27a8bf09004efcf40374 Mon Sep 17 00:00:00 2001
+From 733997f252cd06d20287bc01ca0c9029ced71df3 Mon Sep 17 00:00:00 2001
 From: Zeyad Nasef <zeyad.nasef.fci@gmail.com>
 Date: Thu, 5 Nov 2026 00:59:41 +0000
 Subject: [PATCH] feat(spotify): open Spotify links in Meld
@@ -26,7 +26,7 @@ add the link manually in the app's "Open by default" settings.
  create mode 100644 app/src/test/kotlin/com/metrolist/spotify/SpotifyLinkTest.kt
 
 diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
-index 91e74af..5c832ea 100644
+index 91e74af..61851ea 100644
 --- a/app/src/main/AndroidManifest.xml
 +++ b/app/src/main/AndroidManifest.xml
 @@ -159,6 +159,26 @@
@@ -35,7 +35,7 @@ index 91e74af..5c832ea 100644
  
 +            <!-- Spotify filter. No autoVerify since we can't verify spotify.com,
 +                 users enable it from "Open by default" -->
-+            <intent-filter>
++            <intent-filter tools:ignore="AppLinkWarning">
 +                <action android:name="android.intent.action.VIEW" />
 +
 +                <category android:name="android.intent.category.DEFAULT" />
